@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,11 @@ var nodecnt int
 var numc int
 var rcount int
 var jobDir string
+var spath string
+var autoinc string
+var numthread int
+var osize uint
+var ocount uint
 var hostsFile *os.File
 
 type container struct {
@@ -75,11 +81,11 @@ func runContainer(cName string, segment uint, bootstrap bool) {
 		host := inspectContainer(cName, "{{(index (index .NetworkSettings.Ports \"3306/tcp\") 0).HostIp}}")
 		cont = &container{cName, ipaddr, pid, segment, host, port, "", bootstrap}
 		waitForNode(cont)
+		conNodes = append(conNodes, cont)
 	}
 
 	// To wait in the end
 	cmdsRun <- cont
-	conNodes = append(conNodes, cont)
 
 }
 
@@ -94,6 +100,19 @@ func runWithMsg(cmd string, msg string) string {
 		}
 	}
 	return string(rval)
+}
+
+func backrunWithMsg(cmd string, msg string) *exec.Cmd {
+	log.Printf("Running %s in background", cmd)
+
+	cmnd := exec.Command("sh", "-c", cmd)
+
+	if err := cmnd.Start(); err != nil {
+		if len(msg) > 0 {
+			log.Fatalf(msg)
+		}
+	}
+	return cmnd
 }
 
 func killandWait() {
@@ -112,6 +131,11 @@ func parseArgs() {
 	flag.StringVar(&ecmd, "ecmd", "--wsrep-sst-method=rsync --core-file ", "Additional command")
 	flag.IntVar(&numc, "numc", 3, "Number of containers")
 	flag.IntVar(&rcount, "rcount", 10, "Number of retries")
+	flag.StringVar(&spath, "spath", "/pxc56/db", "Sysbench lua db")
+	flag.StringVar(&autoinc, "autoinc", "off", "Auto-inc for sysbench")
+	flag.IntVar(&numthread, "numt", 8, "Number of sysbench threads")
+	flag.UintVar(&osize, "osize", 500, "Size of each table")
+	flag.UintVar(&ocount, "ocount", 8, "Number of tables")
 }
 
 func buildImage() {
@@ -132,9 +156,14 @@ func buildImage() {
 
 }
 
-//func loadData(){
-//cmd := "sysbench --test=%s/parallel_prepare.lua ---report-interval=10  --oltp-auto-inc=$AUTOINC --mysql-db=test  --db-driver=mysql --num-threads=$NUMT --mysql-engine-trx=yes --mysql-table-engine=innodb --mysql-socket=$FIRSTSOCK --mysql-user=root  --oltp-table-size=$TSIZE --oltp_tables_count=$TCOUNT    prepare 2>&1 | tee $LOGDIR/sysbench_prepare.txt "
-//}
+func loadData() {
+	node := <-upNodes
+	cmd := "sysbench --test=%s/parallel_prepare.lua ---report-interval=10  --oltp-auto-inc=%s --mysql-db=test  --db-driver=mysql --num-threads=%d --mysql-engine-trx=yes --mysql-table-engine=innodb --mysql-socket=%s --mysql-user=root  --oltp-table-size=%d --oltp_tables_count=%d prepare"
+
+	cmd = fmt.Sprintf(cmd, spath, autoinc, numthread, node.socket, osize, ocount)
+
+	runWithMsg(cmd, "Failed to run sysbench to load data")
+}
 
 func startNode(bootstrap bool) {
 	var cmnd string
@@ -152,19 +181,20 @@ func startNode(bootstrap bool) {
 }
 
 func waitForNode(node *container) {
-	time.Sleep(time.Second * 1)
-	_ = runWithMsg(fmt.Sprintf("mysqladmin -h %s -w%d -P %d -u root ping &>/dev/null", node.host, rcount, node.port), fmt.Sprintf("Node %s failed to come up", node.name))
-	if node.bootstrap {
-		spawnSock(node)
-	} else {
-		go spawnSock(node)
-	}
+	time.Sleep(time.Second * 5)
+	_ = runWithMsg(fmt.Sprintf("mysqladmin -h %s -wait=%d -P %d -u root ping &>/dev/null", node.host, rcount, node.port), fmt.Sprintf("Node %s failed to come up", node.name))
+	//if node.bootstrap {
+	//spawnSock(node)
+	//} else {
+	go spawnSock(node)
+	//}
 }
 
 func spawnSock(node *container) {
 	sock := jobDir + "/" + node.name + ".sock"
 
-	_ = runWithMsg(fmt.Sprintf("socat UNIX-LISTEN:%s,fork,reuseaddr TCP:%s:%d", sock, node.host, node.port), fmt.Sprintf("Failed to spawn socket %s for %s", sock, node.name))
+	_ = backrunWithMsg(fmt.Sprintf("socat UNIX-LISTEN:%s,fork,reuseaddr TCP:%s:%d", sock, node.host, node.port), fmt.Sprintf("Failed to spawn socket %s for %s", sock, node.name))
+	//defer cmnd.Wait()
 
 	node.socket = sock
 	upNodes <- node
@@ -183,15 +213,16 @@ func preClean() {
 
 func main() {
 	var err error
+	parseArgs()
+	flag.Parse()
+
 	cmdsRun = make(chan *container, numc+1)
 	upNodes = make(chan *container, numc+1)
 	conNodes = make([]*container, numc+1)
 	nodecnt = 1
+	runtime.GOMAXPROCS(10)
 
 	preClean()
-
-	parseArgs()
-	flag.Parse()
 
 	dockerImage = "ronin/pxc:tarball-" + platform
 	buildImage()
@@ -209,12 +240,12 @@ func main() {
 		"dnscluster": fmt.Sprintf(" -d  -i -v /dev/log:/dev/log -e SST_SYSLOG_TAG=dnsmasq -v %s:/dnsmasq.hosts --name dnscluster ronin/dnsmasq &>/tmp/dnscluster-run.log", hostsFile.Name()),
 	}
 
-	fmt.Println("Hello World")
 	runContainer("dnscluster", 0, false)
 	runC = "-P -e SST_SYSLOG_TAG=Dock%d --name Dock%d  -d  -i -v /dev/log:/dev/log -h Dock%d " + fmt.Sprintf(" --dns %s %s bash -c \"ulimit -c unlimited && %s %s --wsrep-provider-options='%s'\" &>/dev/null", dnsIp, dockerImage, cmd, ecmd, addop) + " %s"
 
 	// bootstrap
 	startNode(true)
+	loadData()
 	time.Sleep(time.Second * 100)
 	killandWait()
 
