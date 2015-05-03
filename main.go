@@ -40,6 +40,7 @@ var numthread int
 var osize uint
 var ocount uint
 var hostsFile *os.File
+var reap []*exec.Cmd
 
 type container struct {
 	name      string
@@ -59,6 +60,22 @@ func inspectContainer(con string, field string) (val string) {
 	return strings.Replace(str, "\n", "", -1)
 }
 
+func appendToFile(file string, data string) error {
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	_, err = f.WriteString(data)
+	if err != nil {
+		log.Fatalf("Write %s", err)
+	}
+
+	f.Close()
+
+	return err
+}
+
 func runContainer(cName string, segment uint, bootstrap bool) {
 	var cont *container
 	cmdline := fmt.Sprintf("docker run %s", containerMap[cName])
@@ -73,7 +90,8 @@ func runContainer(cName string, segment uint, bootstrap bool) {
 		dnsIp = ipaddr
 		cont = &container{cName, ipaddr, 0, segment, "", 0, "", bootstrap}
 	} else {
-		if err := ioutil.WriteFile(hostsFile.Name(), []byte(ipaddr), 0644); err != nil {
+		data := fmt.Sprintf("%s %s\n%s %s.ci.percona.com\n", ipaddr, cName, ipaddr, cName)
+		if err := appendToFile(hostsFile.Name(), data); err != nil {
 			log.Fatalf("Failed to write ip address to hosts file")
 		}
 		pid, _ := strconv.Atoi(inspectContainer(cName, "{{.State.Pid}}"))
@@ -121,6 +139,11 @@ func killandWait() {
 		log.Printf("Stopping container %s", cname.name)
 		_ = runWithMsg(fmt.Sprintf("docker stop %s", cname.name), fmt.Sprintf("Container %s failed to stop", cname.name))
 
+	}
+
+	for _, r := range reap {
+		r.Process.Kill()
+		r.Wait()
 	}
 }
 
@@ -180,8 +203,14 @@ func startNode(bootstrap bool) {
 
 }
 
+func startOthers() {
+	for i := 2; i <= numc; i++ {
+		startNode(false)
+	}
+}
+
 func waitForNode(node *container) {
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 10)
 	_ = runWithMsg(fmt.Sprintf("mysqladmin -h %s -wait=%d -P %d -u root ping &>/dev/null", node.host, rcount, node.port), fmt.Sprintf("Node %s failed to come up", node.name))
 	//if node.bootstrap {
 	//spawnSock(node)
@@ -193,22 +222,23 @@ func waitForNode(node *container) {
 func spawnSock(node *container) {
 	sock := jobDir + "/" + node.name + ".sock"
 
-	_ = backrunWithMsg(fmt.Sprintf("socat UNIX-LISTEN:%s,fork,reuseaddr TCP:%s:%d", sock, node.host, node.port), fmt.Sprintf("Failed to spawn socket %s for %s", sock, node.name))
+	cmnd := backrunWithMsg(fmt.Sprintf("socat UNIX-LISTEN:%s,fork,reuseaddr TCP:%s:%d", sock, node.host, node.port), fmt.Sprintf("Failed to spawn socket %s for %s", sock, node.name))
 	//defer cmnd.Wait()
+	reap = append(reap, cmnd)
 
 	node.socket = sock
 	upNodes <- node
 
 }
 func preClean() {
-	_ = runWithMsg("docker rm -f dnscluster", "")
-	_ = runWithMsg("pkill -9 -f socat", "")
-	_ = runWithMsg("pkill -9 -f mysqld", "")
 
+	_ = runWithMsg("docker rm -f dnscluster", "")
 	for i := 0; i < MAXC; i++ {
 		_ = runWithMsg("docker stop Dock"+fmt.Sprintf("%d", i), "")
 		_ = runWithMsg("docker rm -f Dock"+fmt.Sprintf("%d", i), "")
 	}
+	_ = runWithMsg("pkill -9 -f socat", "")
+	_ = runWithMsg("pkill -9 -f mysqld", "")
 }
 
 func main() {
@@ -218,7 +248,6 @@ func main() {
 
 	cmdsRun = make(chan *container, numc+1)
 	upNodes = make(chan *container, numc+1)
-	conNodes = make([]*container, numc+1)
 	nodecnt = 1
 	runtime.GOMAXPROCS(10)
 
@@ -240,13 +269,15 @@ func main() {
 		"dnscluster": fmt.Sprintf(" -d  -i -v /dev/log:/dev/log -e SST_SYSLOG_TAG=dnsmasq -v %s:/dnsmasq.hosts --name dnscluster ronin/dnsmasq &>/tmp/dnscluster-run.log", hostsFile.Name()),
 	}
 
+	defer killandWait()
 	runContainer("dnscluster", 0, false)
 	runC = "-P -e SST_SYSLOG_TAG=Dock%d --name Dock%d  -d  -i -v /dev/log:/dev/log -h Dock%d " + fmt.Sprintf(" --dns %s %s bash -c \"ulimit -c unlimited && %s %s --wsrep-provider-options='%s'\" &>/dev/null", dnsIp, dockerImage, cmd, ecmd, addop) + " %s"
 
 	// bootstrap
 	startNode(true)
 	loadData()
+
+	startOthers()
 	time.Sleep(time.Second * 100)
-	killandWait()
 
 }
