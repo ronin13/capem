@@ -321,7 +321,7 @@ func stopNodes() {
 	for ind, node := range conNodes {
 		if ind == list[ind] && ind != 0 {
 			//runSQL("mysqladmin  -u root shutdown",
-			runWithMsg(fmt.Sprintf("docker stop %s", ind), "Unable to stop node")
+			runWithMsg(fmt.Sprintf("docker stop %s", string(ind)), "Unable to stop node")
 			node.stopped = true
 		}
 		counter++
